@@ -1,11 +1,11 @@
 # cogs/export_html.py
-# Discord風HTMLログ（強化版）
-# ✅ 日付区切り
+# Discord風HTMLログ（JST + edited + 添付カード強化）
+# ✅ 日付区切り（JST）
 # ✅ ロール色で名前色
 # ✅ スタンプ/リアクション表示
 # ✅ スレッド/返信強化（ジャンプリンク/スレッドリンク）
-#
-# /export_html channel:#ch limit:2000
+# ✅ edited 表示（最終編集時刻）
+# ✅ 添付ファイルの埋め込みカード（画像以外もカード風、画像はプレビュー）
 
 from __future__ import annotations
 
@@ -13,12 +13,16 @@ import html
 import os
 import re
 import tempfile
-from datetime import datetime, date, timezone
-from typing import Optional, List, Tuple
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+
+# ---------- JST ----------
+JST = timezone(timedelta(hours=9))
 
 
 # ---------- helpers ----------
@@ -38,7 +42,7 @@ _URL_RE = re.compile(r"(https?://[^\s<]+)")
 
 
 def _linkify(text_html_escaped: str) -> str:
-    # text_html_escaped は既に escape 済み想定
+    # text_html_escaped は escape 済み
     def repl(m):
         u = m.group(1)
         esc = _escape_attr(u)
@@ -54,14 +58,16 @@ def _format_content(msg: discord.Message) -> str:
     return base
 
 
-def _format_time(dt: datetime) -> str:
-    # HTMLは「見た目がDiscordっぽい」優先で 24h 表記
-    # JSTに寄せたいなら: dt.astimezone(datetime.now().astimezone().tzinfo)
-    return dt.astimezone(datetime.now().astimezone().tzinfo)
+def _format_time_jst(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%H:%M")
 
 
-def _format_date(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y/%m/%d")
+def _format_datetime_jst(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y/%m/%d %H:%M")
+
+
+def _format_date_jst(dt: datetime) -> str:
+    return dt.astimezone(JST).strftime("%Y/%m/%d")
 
 
 def _avatar_url(user: discord.abc.User) -> str:
@@ -70,22 +76,19 @@ def _avatar_url(user: discord.abc.User) -> str:
 
 
 def _jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
-    # DiscordメッセージURL
     return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
 
 
 def _hex_color_from_member(member: Optional[discord.Member]) -> str:
-    # role color (0 means default)
     if not member:
         return "#dbdee1"
-    c = member.color  # discord.Color
+    c = member.color
     if getattr(c, "value", 0) == 0:
         return "#dbdee1"
     return f"#{c.value:06x}"
 
 
 def _emoji_to_html(r: discord.Reaction) -> str:
-    # 絵文字の表示（カスタムは画像URLが取れることが多いのでimgに）
     e = r.emoji
     count = r.count
     if isinstance(e, discord.PartialEmoji) and e.is_custom_emoji():
@@ -96,13 +99,23 @@ def _emoji_to_html(r: discord.Reaction) -> str:
           <span class="reactCount">{count}</span>
         </span>
         """
-    # unicode emoji
     return f"""
     <span class="react">
       <span class="reactEmoji">{_escape(str(e))}</span>
       <span class="reactCount">{count}</span>
     </span>
     """
+
+
+def _human_size(n: int) -> str:
+    # 添付サイズ表示（簡易）
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n/1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n/1024/1024:.1f} MB"
+    return f"{n/1024/1024/1024:.1f} GB"
 
 
 # ---------- HTML ----------
@@ -123,6 +136,9 @@ HTML_TEMPLATE = """<!doctype html>
   --chip:#1e1f22;
   --react:#232428;
   --reactBorder:#3f4147;
+
+  --cardBg:#1f2125;
+  --cardBorder:#3f4147;
 }}
 *{{box-sizing:border-box}}
 body{{
@@ -164,7 +180,10 @@ body{{
 .metaLine{{display:flex; gap:8px; align-items:baseline; flex-wrap:wrap}}
 .name{{font-weight:800; font-size:14px}}
 .time{{color:var(--muted); font-size:12px}}
-
+.edited{{
+  color:var(--muted);
+  font-size:12px;
+}}
 .content{{margin-top:2px; font-size:14px; line-height:1.45; word-wrap:break-word}}
 .mdLink{{color:var(--link); text-decoration:none}}
 .mdLink:hover{{text-decoration:underline}}
@@ -196,23 +215,10 @@ body{{
 .threadChip a{{color:var(--link); text-decoration:none}}
 .threadChip a:hover{{text-decoration:underline}}
 
-.attachments{{margin-top:8px; display:flex; flex-direction:column; gap:8px}}
-.file{{
-  border:1px solid var(--line);
-  background:var(--panel);
-  border-radius:10px;
-  padding:10px;
-  font-size:13px;
-}}
-.img{{
-  max-width:520px; border-radius:12px;
-  border:1px solid var(--line);
-}}
-
 .stickers{{margin-top:8px; display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end}}
 .sticker{{
   display:flex; flex-direction:column; gap:6px;
-  max-width:200px;
+  max-width:220px;
 }}
 .sticker img{{
   width:160px; height:auto; border-radius:12px;
@@ -232,6 +238,53 @@ body{{
 .reactImg{{width:16px; height:16px}}
 .reactEmoji{{font-size:14px; line-height:1}}
 .reactCount{{color:var(--text); font-weight:800}}
+
+.attachments{{margin-top:8px; display:flex; flex-direction:column; gap:10px}}
+.attCard{{
+  border:1px solid var(--cardBorder);
+  background:var(--cardBg);
+  border-radius:12px;
+  overflow:hidden;
+  max-width:560px;
+}}
+.attPreview{{
+  display:block;
+  width:100%;
+  max-height:360px;
+  object-fit:cover;
+  background:#111;
+}}
+.attBody{{
+  padding:10px 12px;
+  display:flex;
+  gap:10px;
+  align-items:flex-start;
+}}
+.attIcon{{
+  width:34px; height:34px;
+  border-radius:10px;
+  background:rgba(255,255,255,.06);
+  display:flex; align-items:center; justify-content:center;
+  flex:0 0 34px;
+  font-weight:900;
+}}
+.attMeta{{min-width:0}}
+.attName{{
+  font-weight:800;
+  font-size:13px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:460px;
+}}
+.attSub{{
+  margin-top:2px;
+  color:var(--muted);
+  font-size:12px;
+}}
+.attActions{{margin-top:6px}}
+.attActions a{{color:var(--link); text-decoration:none; font-size:12px}}
+.attActions a:hover{{text-decoration:underline}}
 
 .embed{{
   margin-top:8px;
@@ -261,7 +314,7 @@ body{{
     {messages}
   </div>
   <div class="footer">
-    Exported by Bot / HTML log (Discord-like)
+    Exported by Bot / HTML log (Discord-like) / Timezone: JST
   </div>
 </body>
 </html>
@@ -278,6 +331,37 @@ def render_day_separator(label: str) -> str:
     """
 
 
+def _attachment_card(a: discord.Attachment) -> str:
+    url = _escape_attr(a.url)
+    fname = _escape(a.filename)
+    ctype = a.content_type or "file"
+    size = _human_size(getattr(a, "size", 0))
+    is_img = ctype.startswith("image/")
+
+    # アイコン（雰囲気）
+    icon = "🖼️" if is_img else "📎"
+
+    preview_html = ""
+    if is_img:
+        preview_html = f'<a href="{url}" target="_blank" rel="noopener noreferrer"><img class="attPreview" src="{url}" alt="{_escape_attr(a.filename)}"></a>'
+
+    return f"""
+    <div class="attCard">
+      {preview_html}
+      <div class="attBody">
+        <div class="attIcon">{icon}</div>
+        <div class="attMeta">
+          <div class="attName">{fname}</div>
+          <div class="attSub">{_escape(ctype)} · {_escape(size)}</div>
+          <div class="attActions">
+            <a href="{url}" target="_blank" rel="noopener noreferrer">開く</a>
+          </div>
+        </div>
+      </div>
+    </div>
+    """
+
+
 def render_message(
     msg: discord.Message,
     guild: discord.Guild,
@@ -285,11 +369,16 @@ def render_message(
 ) -> str:
     author = msg.author
     name = _escape(getattr(author, "display_name", author.name))
-    time_text = _escape(_format_time(msg.created_at))
+    time_text = _escape(_format_time_jst(msg.created_at))
     avatar = _escape_attr(_avatar_url(author))
     name_color = _escape_attr(_hex_color_from_member(member))
 
-    # ---- reply (stronger) ----
+    # edited
+    edited_html = ""
+    if msg.edited_at:
+        edited_html = f'<span class="edited">（編集済み { _escape(_format_time_jst(msg.edited_at)) }）</span>'
+
+    # reply (jump + snippet)
     reply_html = ""
     if msg.reference and msg.reference.message_id:
         ref_mid = msg.reference.message_id
@@ -297,14 +386,12 @@ def render_message(
         jump = _jump_url(guild.id, ref_cid, ref_mid)
 
         ref_name = "不明"
-        ref_snip = ""
+        ref_snip = "（取得できない返信先）"
         if isinstance(msg.reference.resolved, discord.Message):
             ref = msg.reference.resolved
             ref_name = getattr(ref.author, "display_name", ref.author.name)
             sn = (ref.clean_content or "").replace("\n", " ")
-            ref_snip = sn[:80] + ("…" if len(sn) > 80 else "")
-        else:
-            ref_snip = "（取得できない返信先）"
+            ref_snip = sn[:100] + ("…" if len(sn) > 100 else "")
 
         reply_html = f"""
         <div class="reply">
@@ -315,31 +402,17 @@ def render_message(
         </div>
         """
 
-    # ---- content ----
     content = _format_content(msg)
-    if not content:
-        content = ""
 
-    # ---- attachments ----
+    # attachments cards
     att_parts: List[str] = []
     for a in msg.attachments:
-        url = _escape_attr(a.url)
-        fname = _escape(a.filename)
-        if a.content_type and a.content_type.startswith("image/"):
-            att_parts.append(
-                f'<a href="{url}" target="_blank" rel="noopener noreferrer">'
-                f'<img class="img" src="{url}" alt="{_escape_attr(a.filename)}"></a>'
-            )
-        else:
-            att_parts.append(
-                f'<div class="file">📎 <a class="mdLink" href="{url}" target="_blank" rel="noopener noreferrer">{fname}</a></div>'
-            )
+        att_parts.append(_attachment_card(a))
     attachments_html = f'<div class="attachments">{"".join(att_parts)}</div>' if att_parts else ""
 
-    # ---- stickers ----
+    # stickers
     sticker_parts: List[str] = []
     for st in getattr(msg, "stickers", []) or []:
-        # st: discord.StickerItem (多くの場合 url を持つ)
         st_name = _escape(getattr(st, "name", "sticker"))
         st_url = getattr(st, "url", None)
         if st_url:
@@ -352,20 +425,19 @@ def render_message(
             sticker_parts.append(f'<div class="sticker"><div class="cap">🧷 {st_name}</div></div>')
     stickers_html = f'<div class="stickers">{"".join(sticker_parts)}</div>' if sticker_parts else ""
 
-    # ---- reactions ----
+    # reactions
     reacts = []
     for r in msg.reactions:
-        # count は取得できる（ただし誰が押したかは不要）
         reacts.append(_emoji_to_html(r))
     reactions_html = f'<div class="reactions">{"".join(reacts)}</div>' if reacts else ""
 
-    # ---- thread info (stronger) ----
+    # thread info
     thread_html = ""
     try:
-        # メッセージからスレッドが作られている場合
         if getattr(msg, "has_thread", False) and getattr(msg, "thread", None):
             th: discord.Thread = msg.thread
-            th_url = _jump_url(guild.id, th.id, th.id)  # ざっくり（Discordはスレッドも channel として扱える）
+            # スレッドURL（channelとしてリンクできる）
+            th_url = f"https://discord.com/channels/{guild.id}/{th.id}"
             thread_html = f"""
             <div class="threadRow">
               <div class="threadChip">
@@ -376,10 +448,7 @@ def render_message(
     except Exception:
         pass
 
-    # チャンネル自体がスレッドの場合、ヘッダをメタとして表示したいケースがあるので、
-    # ここは export 側で header meta に表示する（後述）。
-
-    # ---- embed (simple) ----
+    # embed (simple)
     embed_html = ""
     if msg.embeds:
         e = msg.embeds[0]
@@ -393,6 +462,7 @@ def render_message(
             </div>
             """
 
+    # content が空でも添付やスタンプがあるので空divは許容
     return f"""
     <div class="msg">
       <img class="avatar" src="{avatar}" alt="">
@@ -400,6 +470,7 @@ def render_message(
         <div class="metaLine">
           <div class="name" style="color:{name_color}">{name}</div>
           <div class="time">{time_text}</div>
+          {edited_html}
         </div>
         {reply_html}
         <div class="content">{content}</div>
@@ -413,13 +484,12 @@ def render_message(
     """
 
 
-# ---------- Cog ----------
 class ExportHtmlCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="export_html", description="Discord風HTMLログを出力します（指定チャンネル）")
-    @app_commands.describe(channel="ログを出力するチャンネル", limit="取得件数（最大5000）")
+    @app_commands.command(name="export_html", description="Discord風HTMLログを出力します（JST/edited/添付カード対応）")
+    @app_commands.describe(channel="ログを出力するチャンネル（テキスト/スレッド）", limit="取得件数（最大5000）")
     async def export_html(
         self,
         interaction: discord.Interaction,
@@ -432,18 +502,16 @@ class ExportHtmlCog(commands.Cog):
 
         guild = interaction.guild
 
-        # TextChannel / Thread のみに絞る（ログの見た目が安定する）
         if not isinstance(channel, (discord.TextChannel, discord.Thread)):
             await interaction.response.send_message("テキストチャンネル or スレッドを指定してください。", ephemeral=True)
             return
 
-        # 権限チェック（閲覧履歴権限）
-        me = guild.me
+        # 権限チェック
         if isinstance(channel, discord.TextChannel):
             if not channel.permissions_for(interaction.user).read_message_history:
                 await interaction.response.send_message("そのチャンネルの履歴を読む権限がありません。", ephemeral=True)
                 return
-            if me and not channel.permissions_for(me).read_message_history:
+            if guild.me and not channel.permissions_for(guild.me).read_message_history:
                 await interaction.response.send_message("Botに履歴を読む権限がありません。", ephemeral=True)
                 return
 
@@ -453,31 +521,25 @@ class ExportHtmlCog(commands.Cog):
         async for m in channel.history(limit=limit, oldest_first=True):
             msgs.append(m)
 
-        # メタ情報
         ch_title = f"#{channel.name}" if isinstance(channel, discord.TextChannel) else f"🧵 {channel.name}"
         title = f"{ch_title} のログ"
-        meta = f"Guild: {guild.name} / Channel: {ch_title} / Messages: {len(msgs)}"
-        if isinstance(channel, discord.Thread):
-            parent = channel.parent
-            if parent:
-                meta += f" / Parent: #{parent.name}"
+        meta = f"Guild: {guild.name} / Channel: {ch_title} / Messages: {len(msgs)} / Timezone: JST"
+        if isinstance(channel, discord.Thread) and channel.parent:
+            meta += f" / Parent: #{channel.parent.name}"
 
-        # メンバーキャッシュ（ロール色のため）
-        # guild.get_member はキャッシュ依存だが、通常十分。足りない場合でも白にフォールバックする。
-        def get_member(user_id: int) -> Optional[discord.Member]:
-            return guild.get_member(user_id)
+        # ロール色用
+        def get_member(uid: int) -> Optional[discord.Member]:
+            return guild.get_member(uid)
 
-        # 日付区切りを挿入しながらレンダ
+        # 日付区切り（JST）
         parts: List[str] = []
         last_day: Optional[str] = None
-
         for m in msgs:
-            day = _format_date(m.created_at)
+            day = _format_date_jst(m.created_at)
             if day != last_day:
                 parts.append(render_day_separator(day))
                 last_day = day
-            member = get_member(m.author.id)
-            parts.append(render_message(m, guild, member))
+            parts.append(render_message(m, guild, get_member(m.author.id)))
 
         body = "".join(parts)
         html_text = HTML_TEMPLATE.format(
@@ -486,7 +548,6 @@ class ExportHtmlCog(commands.Cog):
             messages=body,
         )
 
-        # 一時ファイルに保存して返す
         with tempfile.TemporaryDirectory() as d:
             filename_base = channel.name if hasattr(channel, "name") else "log"
             path = os.path.join(d, "discord_like_log.html")
@@ -494,8 +555,8 @@ class ExportHtmlCog(commands.Cog):
                 f.write(html_text)
 
             await interaction.followup.send(
-                content=f"✅ Discord風HTMLログを出力しました。\n{ch_title} / {len(msgs)}件",
-                file=discord.File(path, filename=f"{filename_base}_discord_like.html"),
+                content=f"✅ Discord風HTMLログを出力しました（JST/edited/添付カード）。\n{ch_title} / {len(msgs)}件",
+                file=discord.File(path, filename=f"{filename_base}_discord_like_JST.html"),
                 ephemeral=True
             )
 
