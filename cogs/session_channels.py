@@ -3,7 +3,7 @@ import json
 import os
 import re
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -34,60 +34,18 @@ def save_db(db: dict):
 
 
 def make_session_id(guild_id: int) -> str:
-    # 例: 20260116-083012-1234567890
     ts = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     return f"{ts}-{guild_id}"
 
 
 def safe_channel_name(name: str) -> str:
-    """
-    Discord channel name rules:
-    - lower case recommended
-    - only [a-z0-9-] ideally, but Discord allows more; still, we sanitize for safety.
-    """
     name = name.strip()
-
-    # 全角スペース等 → 半角スペース → ハイフン
     name = re.sub(r"\s+", "-", name)
-
-    # 記号を削る（日本語は残してOKだが、ここではより安全に）
-    # 日本語も通すなら下の行を緩めてOK。
     name = re.sub(r"[^0-9A-Za-zぁ-んァ-ン一-龥ー\-]", "", name)
-
-    # 連続ハイフン整理
     name = re.sub(r"-{2,}", "-", name).strip("-")
-
     if not name:
-        name = "player"
-
-    # 100文字制限（discordは実際は100）
-    return name[:90]
-
-
-async def ensure_unique_text_channel(
-    category: discord.CategoryChannel,
-    base_name: str,
-    overwrites: dict,
-    topic: str,
-) -> discord.TextChannel:
-    """
-    base_name が衝突したら -2, -3 を付けてユニーク化して作る
-    """
-    existing = {c.name for c in category.text_channels}
-    name = base_name
-    if name in existing:
-        i = 2
-        while f"{base_name}-{i}" in existing:
-            i += 1
-        name = f"{base_name}-{i}"
-
-    ch = await category.create_text_channel(
-        name=name,
-        overwrites=overwrites,
-        topic=topic[:1024],
-        reason="session auto build",
-    )
-    return ch
+        name = "session"
+    return name[:90].lower()
 
 
 def mention_list(user_ids: List[int]) -> str:
@@ -119,9 +77,8 @@ class SessionPanelView(discord.ui.View):
         if ok:
             await self._refresh_panel(interaction)
 
-    @discord.ui.button(label="チャンネル作成", style=discord.ButtonStyle.primary, custom_id="session_build")
+    @discord.ui.button(label="チャンネル作成/更新", style=discord.ButtonStyle.primary, custom_id="session_build")
     async def build(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # GMのみ
         s = self.cog.get_session(self.session_id)
         if not s:
             await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
@@ -132,13 +89,13 @@ class SessionPanelView(discord.ui.View):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            result = await self.cog.build_channels(self.session_id, interaction.guild)
+            result = await self.cog.build_or_update_channels(self.session_id, interaction.guild)
             await interaction.followup.send(result, ephemeral=True)
             await self._refresh_panel(interaction)
         except Exception as e:
-            await interaction.followup.send(f"作成中にエラー: {e}", ephemeral=True)
+            await interaction.followup.send(f"作成/更新中にエラー: {e}", ephemeral=True)
 
-    @discord.ui.button(label="ロック/解除", style=discord.ButtonStyle.danger, custom_id="session_lock")
+    @discord.ui.button(label="参加ロック/解除", style=discord.ButtonStyle.danger, custom_id="session_lock")
     async def lock(self, interaction: discord.Interaction, button: discord.ui.Button):
         s = self.cog.get_session(self.session_id)
         if not s:
@@ -161,8 +118,7 @@ class SessionChannelsCog(commands.Cog):
         self.bot = bot
         ensure_data_dir()
 
-        # 永続View（再起動してもボタン生きる）
-        # ※ 既存セッション全部にViewを復元
+        # 永続View復元
         db = load_db()
         for sid in db.get("sessions", {}).keys():
             self.bot.add_view(SessionPanelView(self, sid))
@@ -208,16 +164,12 @@ class SessionChannelsCog(commands.Cog):
         )
         e.add_field(name=f"参加者（{len(session.get('players', []))}）", value=mention_list(session.get("players", [])), inline=False)
 
-        cat = session.get("category_id")
-        if cat:
-            e.add_field(name="カテゴリ", value=f"<#{cat}>", inline=False)
-
-        all_ch = session.get("channel_all_id")
-        if all_ch:
-            e.add_field(name="全体", value=f"<#{all_ch}>", inline=True)
-        gm_ch = session.get("channel_gm_id")
-        if gm_ch:
-            e.add_field(name="GM", value=f"<#{gm_ch}>", inline=True)
+        if session.get("category_id"):
+            e.add_field(name="カテゴリ", value=f"<#{session['category_id']}>", inline=False)
+        if session.get("channel_all_id"):
+            e.add_field(name="参加者全体", value=f"<#{session['channel_all_id']}>", inline=True)
+        if session.get("channel_gm_id"):
+            e.add_field(name="GM", value=f"<#{session['channel_gm_id']}>", inline=True)
 
         return e
 
@@ -245,7 +197,32 @@ class SessionChannelsCog(commands.Cog):
         view = SessionPanelView(self, session_id)
         await msg.edit(embed=self.build_embed(s), view=view)
 
-    async def build_channels(self, session_id: str, guild: discord.Guild) -> str:
+    async def _apply_all_channel_overwrites(
+        self,
+        guild: discord.Guild,
+        channel: discord.TextChannel,
+        gm_member: discord.Member,
+        player_ids: List[int],
+    ):
+        """
+        参加者全体チャンネルの権限を「参加者＋GMだけ見える」に揃える
+        """
+        everyone = guild.default_role
+
+        overwrites = {
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+            gm_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+        }
+
+        for uid in player_ids:
+            m = guild.get_member(uid)
+            if m:
+                overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+
+        await channel.edit(overwrites=overwrites, reason="session participants updated")
+
+    async def build_or_update_channels(self, session_id: str, guild: discord.Guild) -> str:
         s = self.get_session(session_id)
         if not s:
             return "セッションが見つかりません。"
@@ -259,105 +236,84 @@ class SessionChannelsCog(commands.Cog):
         if gm_member is None:
             return "GMがこのサーバーに見つかりません。"
 
-        everyone = guild.default_role
-
-        # 既にカテゴリ作ってたら再利用（IDが残ってる場合）
-        category = None
+        # カテゴリ
+        category: Optional[discord.CategoryChannel] = None
         if s.get("category_id"):
-            category = guild.get_channel(s["category_id"])
-            if category and not isinstance(category, discord.CategoryChannel):
-                category = None
+            cat = guild.get_channel(s["category_id"])
+            if isinstance(cat, discord.CategoryChannel):
+                category = cat
 
         if category is None:
-            # カテゴリ新規作成
-            cat_name = f"🎭{s['name']}"
-            category = await guild.create_category(name=cat_name, reason="session auto build")
+            category = await guild.create_category(name=f"🎭{s['name']}", reason="session auto build")
             s["category_id"] = category.id
 
-        # 全体ch
-        if not s.get("channel_all_id") or not guild.get_channel(s["channel_all_id"]):
+        base = safe_channel_name(s["name"])
+
+        # 参加者全体チャンネル（1つ）
+        all_ch: Optional[discord.TextChannel] = None
+        if s.get("channel_all_id"):
+            ch = guild.get_channel(s["channel_all_id"])
+            if isinstance(ch, discord.TextChannel):
+                all_ch = ch
+
+        if all_ch is None:
+            everyone = guild.default_role
             overwrites_all = {
                 everyone: discord.PermissionOverwrite(view_channel=False),
                 guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
+                gm_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             }
-            # GM＋参加者を許可
-            overwrites_all[gm_member] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
             for uid in players:
                 m = guild.get_member(uid)
                 if m:
                     overwrites_all[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-            ch_all = await ensure_unique_text_channel(
-                category,
-                base_name=f"全体-{safe_channel_name(s['name'])}",
+            all_ch = await category.create_text_channel(
+                name=f"参加者-{base}",
                 overwrites=overwrites_all,
-                topic=f"Session {s['id']} / 全体",
+                topic=f"Session {s['id']} / 参加者全体",
+                reason="session auto build",
             )
-            s["channel_all_id"] = ch_all.id
+            s["channel_all_id"] = all_ch.id
+        else:
+            # 既存なら「新参加者」を反映
+            await self._apply_all_channel_overwrites(guild, all_ch, gm_member, players)
 
-        # GM ch
-        if not s.get("channel_gm_id") or not guild.get_channel(s["channel_gm_id"]):
+        # GM専用（不要ならここ丸ごと削除OK）
+        gm_ch: Optional[discord.TextChannel] = None
+        if s.get("channel_gm_id"):
+            ch = guild.get_channel(s["channel_gm_id"])
+            if isinstance(ch, discord.TextChannel):
+                gm_ch = ch
+
+        if gm_ch is None:
+            everyone = guild.default_role
             overwrites_gm = {
                 everyone: discord.PermissionOverwrite(view_channel=False),
                 guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
                 gm_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
             }
-            ch_gm = await ensure_unique_text_channel(
-                category,
-                base_name=f"gm-{safe_channel_name(s['name'])}",
+            gm_ch = await category.create_text_channel(
+                name=f"gm-{base}",
                 overwrites=overwrites_gm,
                 topic=f"Session {s['id']} / GM only",
+                reason="session auto build",
             )
-            s["channel_gm_id"] = ch_gm.id
-
-        # 個別ch（表示名をベースにする）
-        # 保存形式: {user_id: channel_id}
-        indi_map: Dict[str, int] = s.setdefault("individual_channels", {})
-
-        for uid in players:
-            key = str(uid)
-            # 既存が生きてたらスキップ
-            if key in indi_map:
-                if guild.get_channel(indi_map[key]):
-                    continue
-
-            member = guild.get_member(uid)
-            if not member:
-                continue
-
-            display = member.display_name
-            base = safe_channel_name(display).lower()
-            # 「個別-表示名」形式（要望どおり suffix なし）
-            base_name = f"個別-{base}"
-
-            overwrites_indi = {
-                everyone: discord.PermissionOverwrite(view_channel=False),
-                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                gm_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-                member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
-            }
-
-            ch = await ensure_unique_text_channel(
-                category,
-                base_name=base_name,
-                overwrites=overwrites_indi,
-                topic=f"Session {s['id']} / 個別 / {member.display_name}",
-            )
-            indi_map[key] = ch.id
+            s["channel_gm_id"] = gm_ch.id
 
         self.save_session(s)
 
-        # 作ったチャンネルに案内を書く（最初の1回だけ）
-        ch_all = guild.get_channel(s["channel_all_id"])
-        if isinstance(ch_all, discord.TextChannel):
-            await ch_all.send(
-                f"セッション **{s['name']}** のチャンネルを作成しました。\n"
+        # 初回案内
+        if all_ch:
+            await all_ch.send(
+                f"✅ セッション **{s['name']}** の参加者チャンネルです。\n"
                 f"GM: <@{gm_id}>\n"
-                f"個別chはカテゴリ内に作成済みです。"
+                f"参加者一覧は参加パネルを確認してね。"
             )
 
-        return "✅ チャンネルを作成/更新しました。カテゴリを確認してね。"
+        return "✅ 参加者全体チャンネル（＋GM専用）を作成/更新しました。"
 
+    # ---- commands ----
     @app_commands.command(name="session_create", description="参加登録パネルを作成します（GM用）")
     @app_commands.describe(name="セッション名")
     async def session_create(self, interaction: discord.Interaction, name: str):
@@ -378,18 +334,15 @@ class SessionChannelsCog(commands.Cog):
             "category_id": None,
             "channel_all_id": None,
             "channel_gm_id": None,
-            "individual_channels": {},
         }
         self.save_session(session)
 
         embed = self.build_embed(session)
         view = SessionPanelView(self, session_id)
 
-        # 永続View登録（再起動してもOK）
-        self.bot.add_view(view)
-
+        self.bot.add_view(view)  # 永続化
         await interaction.response.send_message(embed=embed, view=view)
-        # 送ったメッセージIDを保存
+
         msg = await interaction.original_response()
         session["panel_message_id"] = msg.id
         self.save_session(session)
