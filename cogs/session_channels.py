@@ -67,15 +67,32 @@ class SessionPanelView(discord.ui.View):
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         ok, msg = self.cog.add_player(self.session_id, interaction.user.id)
         await interaction.response.send_message(msg, ephemeral=True)
+
         if ok:
+            # ✅ 参加パネル更新
             await self._refresh_panel(interaction)
+
+            # ✅ 既存の参加者全体チャンネルがあるなら、即座に権限更新
+            # （チャンネルがまだ無ければ何もしない）
+            try:
+                await self.cog.auto_update_participants_channel(self.session_id, interaction.guild)
+            except Exception:
+                # 権限更新失敗しても参加自体は成功しているので黙殺（必要ならログ）
+                pass
 
     @discord.ui.button(label="辞退", style=discord.ButtonStyle.secondary, custom_id="session_leave")
     async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
         ok, msg = self.cog.remove_player(self.session_id, interaction.user.id)
         await interaction.response.send_message(msg, ephemeral=True)
+
         if ok:
             await self._refresh_panel(interaction)
+
+            # ✅ 辞退時も、既存チャンネルがあれば権限から外す
+            try:
+                await self.cog.auto_update_participants_channel(self.session_id, interaction.guild)
+            except Exception:
+                pass
 
     @discord.ui.button(label="チャンネル作成/更新", style=discord.ButtonStyle.primary, custom_id="session_build")
     async def build(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -204,11 +221,7 @@ class SessionChannelsCog(commands.Cog):
         gm_member: discord.Member,
         player_ids: List[int],
     ):
-        """
-        参加者全体チャンネルの権限を「参加者＋GMだけ見える」に揃える
-        """
         everyone = guild.default_role
-
         overwrites = {
             everyone: discord.PermissionOverwrite(view_channel=False),
             guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
@@ -220,7 +233,31 @@ class SessionChannelsCog(commands.Cog):
             if m:
                 overwrites[m] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
 
-        await channel.edit(overwrites=overwrites, reason="session participants updated")
+        await channel.edit(overwrites=overwrites, reason="session participants auto-updated")
+
+    async def auto_update_participants_channel(self, session_id: str, guild: discord.Guild):
+        """
+        ✅ 参加/辞退ボタン押下時に呼ぶ：
+        すでに参加者チャンネルが存在するなら、権限を最新参加者に合わせて更新する。
+        """
+        s = self.get_session(session_id)
+        if not s:
+            return
+
+        all_id = s.get("channel_all_id")
+        if not all_id:
+            return  # まだ作ってない
+
+        ch = guild.get_channel(all_id)
+        if not isinstance(ch, discord.TextChannel):
+            return
+
+        gm_member = guild.get_member(s["gm_id"])
+        if not gm_member:
+            return
+
+        players = s.get("players", [])
+        await self._apply_all_channel_overwrites(guild, ch, gm_member, players)
 
     async def build_or_update_channels(self, session_id: str, guild: discord.Guild) -> str:
         s = self.get_session(session_id)
@@ -276,10 +313,9 @@ class SessionChannelsCog(commands.Cog):
             )
             s["channel_all_id"] = all_ch.id
         else:
-            # 既存なら「新参加者」を反映
             await self._apply_all_channel_overwrites(guild, all_ch, gm_member, players)
 
-        # GM専用（不要ならここ丸ごと削除OK）
+        # GM専用（不要なら削除OK）
         gm_ch: Optional[discord.TextChannel] = None
         if s.get("channel_gm_id"):
             ch = guild.get_channel(s["channel_gm_id"])
@@ -303,7 +339,6 @@ class SessionChannelsCog(commands.Cog):
 
         self.save_session(s)
 
-        # 初回案内
         if all_ch:
             await all_ch.send(
                 f"✅ セッション **{s['name']}** の参加者チャンネルです。\n"
@@ -340,7 +375,7 @@ class SessionChannelsCog(commands.Cog):
         embed = self.build_embed(session)
         view = SessionPanelView(self, session_id)
 
-        self.bot.add_view(view)  # 永続化
+        self.bot.add_view(view)
         await interaction.response.send_message(embed=embed, view=view)
 
         msg = await interaction.original_response()
@@ -370,6 +405,11 @@ class SessionChannelsCog(commands.Cog):
         await interaction.response.send_message(msg, ephemeral=True)
         if ok:
             await self.refresh_panel(session_id, interaction=interaction)
+            # ✅ 手動追加でも即更新
+            try:
+                await self.auto_update_participants_channel(session_id, interaction.guild)
+            except Exception:
+                pass
 
     @app_commands.command(name="session_remove", description="参加者を手動削除（GM用）")
     @app_commands.describe(session_id="セッションID", member="削除するメンバー")
@@ -385,6 +425,11 @@ class SessionChannelsCog(commands.Cog):
         await interaction.response.send_message(msg, ephemeral=True)
         if ok:
             await self.refresh_panel(session_id, interaction=interaction)
+            # ✅ 手動削除でも即更新
+            try:
+                await self.auto_update_participants_channel(session_id, interaction.guild)
+            except Exception:
+                pass
 
 
 async def setup(bot: commands.Bot):
