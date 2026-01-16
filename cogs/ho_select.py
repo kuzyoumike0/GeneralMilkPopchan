@@ -1,5 +1,6 @@
 # cogs/ho_select.py
 # HO選択 → ニックネーム変更（HO名＠元の名前） → 個別ch自動作成（GM含む）
+# ✅ セッション終了で一括ニックネーム復元（/session_end）
 
 from __future__ import annotations
 
@@ -59,18 +60,26 @@ def safe_channel_name(text: str, max_len: int = 90) -> str:
     return s[:max_len].lower() if s else "personal"
 
 
-async def set_nickname_ho(member: discord.Member, ho: str) -> tuple[bool, str]:
+def build_ho_nick(member: discord.Member, ho: str) -> str:
     """
-    ニックネームを「HO名＠元の名前」に変更
+    HO名＠元の名前（元の名前はアカウント名を使用）
     """
     base = member.name
     new_nick = f"{ho}＠{base}"
     if len(new_nick) > 32:
         new_nick = new_nick[:32]
+    return new_nick
 
+
+async def try_set_nickname(member: discord.Member, nick: Optional[str], reason: str) -> Tuple[bool, str]:
+    """
+    nick: None を渡すとニックネーム解除（元の表示に戻る）
+    """
     try:
-        await member.edit(nick=new_nick, reason="HO selected")
-        return True, f"ニックネームを **{new_nick}** に変更しました。"
+        await member.edit(nick=nick, reason=reason)
+        if nick is None:
+            return True, "ニックネームを元に戻しました。"
+        return True, f"ニックネームを **{nick}** に変更しました。"
     except discord.Forbidden:
         return False, "権限不足でニックネームを変更できません（Manage Nicknames / ロール順位）。"
     except Exception as e:
@@ -207,7 +216,7 @@ class HOSelectCog(commands.Cog):
         lines = []
         for ho in hos:
             lines.append(f"{'✅' if ho in taken else '⬜'} {ho}")
-        e.add_field(name="HO一覧", value="\n".join(lines), inline=False)
+        e.add_field(name="HO一覧", value="\n".join(lines) if lines else "（未設定）", inline=False)
 
         e.set_footer(text="HOを選ぶと、ニックネーム変更＋個別chが自動作成されます")
         return e
@@ -222,11 +231,17 @@ class HOSelectCog(commands.Cog):
         msg = await ch.fetch_message(s["ho_panel_message_id"])
         await msg.edit(embed=self.build_embed(s), view=HOSelectView(self, session_id))
 
-    # ---------- Slash commands ----------
-    @app_commands.command(name="ho_setup")
+    # =========================
+    # Slash commands
+    # =========================
+    @app_commands.command(name="ho_setup", description="HO候補を登録します（GM用）")
+    @app_commands.describe(session_id="セッションID", hos="HO候補（カンマ区切り）")
     async def ho_setup(self, interaction: discord.Interaction, session_id: str, hos: str):
         s = self.get_session(session_id)
-        if not s or interaction.user.id != s.get("gm_id"):
+        if not s:
+            await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
+            return
+        if interaction.user.id != s.get("gm_id"):
             await interaction.response.send_message("GMのみ実行できます。", ephemeral=True)
             return
 
@@ -235,25 +250,90 @@ class HOSelectCog(commands.Cog):
         s["ho_taken"] = {}
         s["ho_personal_channels"] = {}
         s["ho_locked"] = False
-        self.save_session(s)
 
+        # ✅ 追加：元ニック退避マップ（user_id(str) -> original nick or None）
+        s["original_nicks"] = {}
+
+        self.save_session(s)
         await interaction.response.send_message("✅ HO候補を登録しました。", ephemeral=True)
 
-    @app_commands.command(name="ho_panel")
+    @app_commands.command(name="ho_panel", description="HO選択パネルを投稿します（GM用）")
+    @app_commands.describe(session_id="セッションID")
     async def ho_panel(self, interaction: discord.Interaction, session_id: str):
         s = self.get_session(session_id)
-        if not s or interaction.user.id != s.get("gm_id"):
+        if not s:
+            await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
+            return
+        if interaction.user.id != s.get("gm_id"):
             await interaction.response.send_message("GMのみ実行できます。", ephemeral=True)
             return
 
         view = HOSelectView(self, session_id)
         self.bot.add_view(view)
+
         await interaction.response.send_message(embed=self.build_embed(s), view=view)
 
         msg = await interaction.original_response()
         s["ho_panel_channel_id"] = interaction.channel_id
         s["ho_panel_message_id"] = msg.id
         self.save_session(s)
+
+    @app_commands.command(name="session_end", description="セッション終了：参加者のニックネームを一括復元（GM用）")
+    @app_commands.describe(session_id="セッションID", lock="終了後にHO選択をロックする")
+    async def session_end(self, interaction: discord.Interaction, session_id: str, lock: bool = True):
+        if not interaction.guild:
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
+            return
+
+        s = self.get_session(session_id)
+        if not s:
+            await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
+            return
+        if interaction.user.id != s.get("gm_id"):
+            await interaction.response.send_message("GMのみ実行できます。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        restored = 0
+        failed = 0
+        fail_lines: List[str] = []
+
+        original_nicks: Dict[str, Optional[str]] = s.get("original_nicks") or {}
+        # original_nicks が空でも、ho_assignments があれば「今のnickを解除」する運用もできるが、
+        # ここは安全に "保存がある人だけ" 復元する（確実）。
+        for uid_s, orig in original_nicks.items():
+            m = interaction.guild.get_member(int(uid_s))
+            if not m:
+                continue
+
+            ok, msg = await try_set_nickname(m, orig, reason=f"Session end restore (session {session_id})")
+            if ok:
+                restored += 1
+            else:
+                failed += 1
+                fail_lines.append(f"- {m.mention}: {msg}")
+
+        if lock:
+            s["ho_locked"] = True
+
+        self.save_session(s)
+
+        # パネル更新
+        try:
+            await self.refresh_panel(session_id, interaction.guild)
+        except Exception:
+            pass
+
+        text = f"✅ セッション終了：ニックネーム復元 完了\n復元: {restored} / 失敗: {failed}"
+        if fail_lines:
+            # 長くなりすぎるのを避ける
+            joined = "\n".join(fail_lines[:15])
+            if len(fail_lines) > 15:
+                joined += f"\n…他 {len(fail_lines)-15}件"
+            text += "\n\n⚠️ 失敗一覧（権限/ロール順位/DM設定ではなくサーバー権限が原因）:\n" + joined
+
+        await interaction.followup.send(text, ephemeral=True)
 
 
 # =========================
@@ -263,7 +343,7 @@ class HOSelect(discord.ui.Select):
     def __init__(self, cog: HOSelectCog, session_id: str):
         self.cog = cog
         self.session_id = session_id
-        s = cog.get_session(session_id)
+        s = cog.get_session(session_id) or {}
         options = [discord.SelectOption(label=ho, value=ho) for ho in s.get("ho_options", [])]
 
         super().__init__(
@@ -276,31 +356,54 @@ class HOSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         s = self.cog.get_session(self.session_id)
-        if not s or s.get("ho_locked"):
-            await interaction.response.send_message("HO選択はできません。", ephemeral=True)
+        if not s:
+            await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
+            return
+        if s.get("ho_locked"):
+            await interaction.response.send_message("HO選択はロックされています。", ephemeral=True)
+            return
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message("サーバー内で実行してください。", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        ok, msg = self.cog.assign_ho(self.session_id, interaction.user.id, self.values[0])
+        ho = self.values[0]
+        ok, msg = self.cog.assign_ho(self.session_id, interaction.user.id, ho)
         if not ok:
             await interaction.followup.send(msg, ephemeral=True)
             return
 
-        nick_ok, nick_msg = await set_nickname_ho(interaction.user, self.values[0])
+        # ✅ 追加：最初の1回だけ元nickを保存（None = nick未設定）
+        originals: Dict[str, Optional[str]] = s.setdefault("original_nicks", {})
+        uid_s = str(interaction.user.id)
+        if uid_s not in originals:
+            originals[uid_s] = interaction.user.nick  # nickが無ければ None
 
+        # ✅ ニックネームを HO名＠元の名前 に変更
+        desired_nick = build_ho_nick(interaction.user, ho)
+        nick_ok, nick_msg = await try_set_nickname(interaction.user, desired_nick, reason="HO selected")
+
+        # ✅ 個別ch作成/更新
         try:
-            ch = await self.cog.create_or_update_personal_channel(
-                interaction.guild, s, interaction.user, self.values[0]
-            )
+            ch = await self.cog.create_or_update_personal_channel(interaction.guild, s, interaction.user, ho)
+            self.cog.save_session(s)  # originals 反映
             await interaction.followup.send(
                 f"{msg}\n{nick_msg if nick_ok else '⚠️ ' + nick_msg}\n個別ch：{ch.mention}",
                 ephemeral=True,
             )
         except Exception as e:
-            await interaction.followup.send(f"{msg}\n⚠️ チャンネル作成失敗: {e}", ephemeral=True)
+            self.cog.save_session(s)
+            await interaction.followup.send(
+                f"{msg}\n{nick_msg if nick_ok else '⚠️ ' + nick_msg}\n⚠️ チャンネル作成失敗: {e}",
+                ephemeral=True,
+            )
 
-        await self.cog.refresh_panel(self.session_id, interaction.guild)
+        # パネル更新
+        try:
+            await self.cog.refresh_panel(self.session_id, interaction.guild)
+        except Exception:
+            pass
 
 
 class HOSelectView(discord.ui.View):
