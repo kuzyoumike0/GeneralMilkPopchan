@@ -1,10 +1,11 @@
 # cogs/ho_select.py
-# ✅ HO選択（ドロップダウン）
-# ✅ HO選択 → ニックネーム変更（HO名＠元の名前）→ 個別ch自動作成（GM含む）
+# ✅ HO候補は PC1〜PC12 固定
+# ✅ GMは /ho_setup_pcs で「今回使うPC人数」を指定するだけ
+# ✅ HO選択 → ニックネーム変更（PCx＠元の名前）→ 個別ch自動作成（GM含む）
 # ✅ 見学ロールは使わない
-# ✅ HOパネルに「👀見学する」ボタン
-#    - 見学ボタン押下で、見学者専用chを作成（GM+本人+Bot）
-#    - セッションの個別ch（HO個別ch）を見学者に「閲覧のみ」で付与
+# ✅ HOパネルに「👀見学する/解除」ボタン
+#    - 見学者専用ch作成（GM+本人+Bot）
+#    - 個別chを見学者に「閲覧のみ」で付与
 # ✅ セッション終了で一括ニックネーム復元（/session_end）
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from discord.ext import commands
 DATA_DIR = "data"
 SESSIONS_PATH = os.path.join(DATA_DIR, "sessions.json")
 JST = timezone(timedelta(hours=9))
+
+MAX_PC = 12
 
 
 # =========================
@@ -49,8 +52,11 @@ def save_db(db: dict):
         json.dump(db, f, ensure_ascii=False, indent=2)
 
 
-def parse_hos(text: str) -> List[str]:
-    return [x.strip() for x in text.split(",") if x.strip()][:25]
+def make_pc_hos(pc_count: int) -> List[str]:
+    pc_count = int(pc_count)
+    if pc_count < 1 or pc_count > MAX_PC:
+        raise ValueError(f"pc_count は 1〜{MAX_PC} の範囲で指定してください。")
+    return [f"PC{i}" for i in range(1, pc_count + 1)]
 
 
 def jst_date() -> str:
@@ -58,10 +64,6 @@ def jst_date() -> str:
 
 
 def safe_channel_name(text: str, max_len: int = 90) -> str:
-    """
-    Discordチャンネル名として安全な形に。
-    日本語OK / 空白→ハイフン / 記号を軽く除去
-    """
     s = (text or "").strip()
     s = re.sub(r"\s+", "-", s)
     s = re.sub(r"[^\wぁ-んァ-ン一-龥ー\-]", "", s)
@@ -70,9 +72,7 @@ def safe_channel_name(text: str, max_len: int = 90) -> str:
 
 
 def build_ho_nick(member: discord.Member, ho: str) -> str:
-    """
-    ニックネーム：HO名＠元の名前（元の名前はアカウント名）
-    """
+    # ニックネーム：HO名＠元の名前（元の名前はアカウント名）
     base = member.name
     new_nick = f"{ho}＠{base}"
     if len(new_nick) > 32:
@@ -81,9 +81,6 @@ def build_ho_nick(member: discord.Member, ho: str) -> str:
 
 
 async def try_set_nickname(member: discord.Member, nick: Optional[str], reason: str) -> Tuple[bool, str]:
-    """
-    nick: None を渡すとニックネーム解除
-    """
     try:
         await member.edit(nick=nick, reason=reason)
         if nick is None:
@@ -189,7 +186,6 @@ class HOSelectCog(commands.Cog):
 
         cat = await self.ensure_spectator_category(guild, session)
 
-        # 見学者専用ch（見学-ユーザ名）
         raw = f"見学-{spectator.display_name}"
         ch_name = safe_channel_name(raw)
 
@@ -203,7 +199,6 @@ class HOSelectCog(commands.Cog):
 
         topic = f"Session:{session['id']} Spectator:{spectator.id} GM:{gm.id}"
 
-        # 既存を探す（記録優先→名前一致）
         record = session.setdefault("spectator_channels", {})  # user_id(str)->channel_id
         uid_s = str(spectator.id)
 
@@ -233,7 +228,7 @@ class HOSelectCog(commands.Cog):
             f"👀 **見学者チャンネル** を作成しました。\n"
             f"- 見学者：{spectator.mention}\n"
             f"- GM：{gm.mention}\n"
-            f"- このセッションの個別chは “閲覧のみ” で見られます。"
+            f"- 個別chは “閲覧のみ” で見られます。"
         )
         return new_ch
 
@@ -246,11 +241,6 @@ class HOSelectCog(commands.Cog):
         *,
         enable: bool,
     ) -> Tuple[int, int]:
-        """
-        enable=True: 見学者を全個別chに追加（閲覧のみ）
-        enable=False: 見学者を全個別chから削除
-        returns: (updated_count, failed_count)
-        """
         updated = 0
         failed = 0
 
@@ -270,7 +260,6 @@ class HOSelectCog(commands.Cog):
                         send_messages=False,
                     )
                 else:
-                    # remove overwrite
                     if spectator in ow:
                         del ow[spectator]
                 await ch.edit(overwrites=ow, reason="spectator perms sync")
@@ -306,7 +295,7 @@ class HOSelectCog(commands.Cog):
             gm: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True),
         }
 
-        # ✅ 現在の見学者を “閲覧のみ” で付与
+        # 現在の見学者を “閲覧のみ” で付与
         spectators = session.get("spectators") or []
         for uid_s in spectators:
             m = guild.get_member(int(uid_s))
@@ -322,14 +311,12 @@ class HOSelectCog(commands.Cog):
         record = session.setdefault("ho_personal_channels", {})
         uid = str(member.id)
 
-        # 既存が記録されていれば更新
         if uid in record:
             ch = guild.get_channel(int(record[uid]))
             if isinstance(ch, discord.TextChannel):
                 await ch.edit(name=name, overwrites=overwrites, topic=topic, reason="HO personal update")
                 return ch
 
-        # なければ作成
         ch = await cat.create_text_channel(name=name, overwrites=overwrites, topic=topic, reason="HO personal create")
         record[uid] = ch.id
         self.save_session(session)
@@ -347,6 +334,7 @@ class HOSelectCog(commands.Cog):
     # ---------- 表示 ----------
     def build_embed(self, session: dict) -> discord.Embed:
         spectators = session.get("spectators") or []
+        pc_count = session.get("pc_count")
 
         e = discord.Embed(
             title=f"🧩 HO選択：{session.get('name','session')}",
@@ -359,6 +347,7 @@ class HOSelectCog(commands.Cog):
             inline=True,
         )
         e.add_field(name="見学者", value=f"{len(spectators)}人（ボタンで参加/解除）", inline=True)
+        e.add_field(name="PC人数", value=(str(pc_count) if pc_count else "未設定"), inline=True)
 
         hos = session.get("ho_options", [])
         taken = session.get("ho_taken", {})
@@ -383,9 +372,9 @@ class HOSelectCog(commands.Cog):
     # =========================
     # Slash commands
     # =========================
-    @app_commands.command(name="ho_setup", description="HO候補を登録します（GM用）")
-    @app_commands.describe(session_id="セッションID", hos="HO候補（カンマ区切り）")
-    async def ho_setup(self, interaction: discord.Interaction, session_id: str, hos: str):
+    @app_commands.command(name="ho_setup_pcs", description="HO候補を PC1〜PCn に自動設定します（GM用）")
+    @app_commands.describe(session_id="セッションID", pc_count="今回使うPC人数（1〜12）")
+    async def ho_setup_pcs(self, interaction: discord.Interaction, session_id: str, pc_count: app_commands.Range[int, 1, MAX_PC]):
         s = self.get_session(session_id)
         if not s:
             await interaction.response.send_message("セッションが見つかりません。", ephemeral=True)
@@ -394,7 +383,11 @@ class HOSelectCog(commands.Cog):
             await interaction.response.send_message("GMのみ実行できます。", ephemeral=True)
             return
 
-        s["ho_options"] = parse_hos(hos)
+        # PC1..PCn を自動生成
+        ho_list = make_pc_hos(int(pc_count))
+
+        s["pc_count"] = int(pc_count)
+        s["ho_options"] = ho_list
         s["ho_assignments"] = {}
         s["ho_taken"] = {}
         s["ho_personal_channels"] = {}
@@ -406,10 +399,20 @@ class HOSelectCog(commands.Cog):
         # 見学者関連
         s["spectators"] = []
         s["spectator_channels"] = {}
-        # s["spectator_category_id"] は必要なら作る
 
         self.save_session(s)
-        await interaction.response.send_message("✅ HO候補を登録しました。", ephemeral=True)
+
+        await interaction.response.send_message(
+            "✅ HO候補を設定しました：\n" + "\n".join(f"- {x}" for x in ho_list),
+            ephemeral=True
+        )
+
+        # パネルが既にあるなら更新
+        try:
+            if interaction.guild:
+                await self.refresh_panel(session_id, interaction.guild)
+        except Exception:
+            pass
 
     @app_commands.command(name="ho_panel", description="HO選択パネルを投稿します（GM用）")
     @app_commands.describe(session_id="セッションID")
@@ -420,6 +423,9 @@ class HOSelectCog(commands.Cog):
             return
         if interaction.user.id != s.get("gm_id"):
             await interaction.response.send_message("GMのみ実行できます。", ephemeral=True)
+            return
+        if not (s.get("ho_options") or []):
+            await interaction.response.send_message("先に /ho_setup_pcs でPC人数を設定してください。", ephemeral=True)
             return
 
         view = HOSelectView(self, session_id)
@@ -471,7 +477,6 @@ class HOSelectCog(commands.Cog):
 
         self.save_session(s)
 
-        # パネル更新
         try:
             await self.refresh_panel(session_id, interaction.guild)
         except Exception:
@@ -498,7 +503,7 @@ class HOSelect(discord.ui.Select):
         options = [discord.SelectOption(label=ho, value=ho) for ho in s.get("ho_options", [])]
 
         super().__init__(
-            placeholder="HOを選択",
+            placeholder="HO（PC）を選択",
             options=options,
             min_values=1,
             max_values=1,
@@ -531,7 +536,7 @@ class HOSelect(discord.ui.Select):
         if uid_s not in originals:
             originals[uid_s] = interaction.user.nick
 
-        # ニックネーム変更
+        # ニックネーム変更（PCx＠元の名前）
         desired_nick = build_ho_nick(interaction.user, ho)
         nick_ok, nick_msg = await try_set_nickname(interaction.user, desired_nick, reason="HO selected")
 
@@ -579,14 +584,12 @@ class HOSelectView(discord.ui.View):
         spectators: List[str] = s.setdefault("spectators", [])
         uid_s = str(interaction.user.id)
 
-        # 追加/解除
         enable = uid_s not in spectators
         if enable:
             spectators.append(uid_s)
         else:
             spectators.remove(uid_s)
 
-        # 見学者専用ch
         spectator_ch_msg = ""
         try:
             if enable:
@@ -595,7 +598,6 @@ class HOSelectView(discord.ui.View):
         except Exception as e:
             spectator_ch_msg = f"\n⚠️ 見学者ch作成に失敗: {e}"
 
-        # 個別chへ閲覧権限を反映
         try:
             updated, failed = await self.cog.apply_spectator_to_all_personals(
                 interaction.guild, s, interaction.user, enable=enable
@@ -613,7 +615,6 @@ class HOSelectView(discord.ui.View):
             ephemeral=True
         )
 
-        # パネル更新
         try:
             await self.cog.refresh_panel(self.session_id, interaction.guild)
         except Exception:
